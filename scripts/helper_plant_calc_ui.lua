@@ -42,9 +42,43 @@ local ICON_REMAP = { tomato = "quagmire_tomato", onion = "quagmire_onion" }
 --解析不到图标时用的占位图(官方图鉴的"?"图标)
 local UNKNOWN_TEX, UNKNOWN_ATLAS = "unknown.tex", "images/scrapbook_icons3.xml"
 
+--官方背包图集清单，也是自己探查时的顺序
+local ICON_ATLASES = {
+	"images/inventoryimages1.xml",
+	"images/inventoryimages2.xml",
+	"images/inventoryimages3.xml",
+	"images/inventoryimages4.xml",
+}
+local OFFICIAL_ATLAS = {}
+for _, a in ipairs(ICON_ATLASES) do
+	OFFICIAL_ATLAS[a] = true
+end
+
+--找图标所在图集。先问官方接口(no_fallback=true)：
+--* 官方图集要再验一次——inventoryItemAtlasLookup 是全局共享缓存，别处若用不带 no_fallback 的
+--  方式查过同一张缺失图，缓存里存的是回退的 images4，不验就会拿到一张不含该图的图集(图标空白)
+--* 模组通过 RegisterInventoryItemAtlas 注册的图集路径必须直接信任：AtlasContains 探不到模组图集，
+--  拿它去验会把别的模组加的作物图标判成缺失，全掉成占位图
+--* 全探不到时退回官方接口给的答案，至少不比改之前更差
+local function FindIconAtlas(tex)
+	local atlas = GetInventoryItemAtlas ~= nil and GetInventoryItemAtlas(tex, true) or nil
+	if atlas ~= nil and (not OFFICIAL_ATLAS[atlas] or TheSim:AtlasContains(atlas, tex)) then
+		return atlas
+	end
+	for _, a in ipairs(ICON_ATLASES) do
+		if TheSim:AtlasContains(a, tex) then
+			return a
+		end
+	end
+	return atlas
+end
+
 --悬停说明的文字：养分净变化(带正负号)与家族数量。两者都是作物的固有属性，只算一次
 local function MakePlantInfoText(plant)
 	local d = Nutrient.GetDelta(plant)
+	if d == nil then--不支持的作物已在 InitPlants 里滤掉，这里只是兜底
+		return ""
+	end
 	local parts = {}
 	for i = 1, 3 do
 		parts[i] = string.format("%+d", d[i])
@@ -59,7 +93,8 @@ local function InitPlants()
 
 	PLANTS = {}
 	for name in pairs(PLANT_DEFS) do
-		if name ~= "randomseed" then
+		--跳过随机种子，以及其它模组新增却没写养分消耗的作物(否则算不出净变化)
+		if name ~= "randomseed" and Nutrient.IsSupported(name) then
 			table.insert(PLANTS, name)
 		end
 	end
@@ -68,7 +103,7 @@ local function InitPlants()
 	ICON_ASSETS, PLANT_INFO = {}, {}
 	for _, plant in ipairs(PLANTS) do
 		local tex = (ICON_REMAP[plant] or plant) .. ".tex"
-		local atlas = GetInventoryItemAtlas(tex, true)--no_fallback=true 保证返回的图集里确实有这张图
+		local atlas = FindIconAtlas(tex)
 		if not atlas then
 			HelperDebug("作物图标缺失，改用占位图标：%s", plant)
 			tex, atlas = UNKNOWN_TEX, UNKNOWN_ATLAS
@@ -163,7 +198,7 @@ local PlantCalcView = GLOBAL_Class(GLOBAL_Widget, function(self, w, h, row_h)
 	local hit = self:AddChild(GLOBAL_Image("images/ui.xml", "blank.tex"))--透明命中层：不带背景色，只提供鼠标焦点区域
 	hit:ScaleToSize(w, h)
 
-	if TUNING.HELPER_PLANT_VIEW_BORDER then
+	if HelperConfig.view_border then
 		for _, line in ipairs({
 			{ 0, h / 2, w, 2 }, { 0, -h / 2, w, 2 },
 			{ -w / 2, 0, 2, h }, { w / 2, 0, 2, h },
@@ -175,7 +210,7 @@ local PlantCalcView = GLOBAL_Class(GLOBAL_Widget, function(self, w, h, row_h)
 		end
 	end
 
-	local pad = TUNING.HELPER_PLANT_VIEW_BORDER and 1 or 0--有边框时外扩，让边界上的线完整显示
+	local pad = HelperConfig.view_border and 1 or 0--有边框时外扩，让边界上的线完整显示
 	self:SetScissor(-w / 2 - pad, -h / 2 - pad, w + pad * 2, h + pad * 2)
 	self.content = self:AddChild(GLOBAL_Widget("content"))
 
@@ -309,7 +344,7 @@ local PlantCalcPanel = GLOBAL_Class(GLOBAL_Widget, function(self)
 
 	--调试开关开启时：补一批"?"占位图标用于测试滚动，不参与选中
 	self.debug_icons = {}
-	if TUNING.HELPER_DEBUG_SWITCH then
+	if HelperConfig.debug then
 		for _ = 1, DEBUG_ICONS do
 			local icon = MakePlantIcon(UNKNOWN_TEX, UNKNOWN_ATLAS)
 			self.view_top.content:AddChild(icon)
@@ -441,6 +476,16 @@ function PlantCalcPanel:RefreshGroups()
 		groups = kept
 	end
 
+	--一组都凑不出来时给一行提示，否则下半区一片空白，玩家分不清是"无解"还是"没选中"
+	if #groups == 0 then
+		local tip = content:AddChild(GLOBAL_Text(GLOBAL.NEWFONT, REQ_FONT))
+		tip:SetString("当前选中的作物没有互补配比")
+		tip:SetColour(REQ_TEXT_COLOUR)
+		tip:SetPosition(0, 0, 0)
+		self.view_bottom:SetContentRows(1)
+		return
+	end
+
 	--先建出来量宽度：槽宽按最宽的比组定，这样窄的组也占同样宽的位，行内排布不漂移
 	local built, max_w = {}, 0
 	for _, g in ipairs(groups) do
@@ -469,8 +514,22 @@ function PlantCalcPanel:IsHoveringViews()
 	return self.view_top.focus or self.view_bottom.focus
 end
 
+--隐藏不会自动释放焦点：递归清掉子树里的焦点。
+--(Widget:ClearFocus 只在自己持有焦点时才往下递归，所以要先找到真正持焦点的那个再清)
+local function ClearFocusTree(widget)
+	if widget.focus then
+		widget:ClearFocus()
+		return
+	end
+	for _, child in pairs(widget.children) do
+		ClearFocusTree(child)
+	end
+end
+
 function PlantCalcPanel:Close()
-	self.view_top:ClearFocus()--隐藏不会自动释放焦点：清掉它，说明行也跟着失焦清空
+	--两个视窗都清：漏掉的焦点会让重开面板后相机缩放的屏蔽一直生效(说明行也跟着失焦清空)
+	ClearFocusTree(self.view_top)
+	ClearFocusTree(self.view_bottom)
 	self:Hide()
 end
 
@@ -489,37 +548,28 @@ AddClassPostConstruct("widgets/controls", function(self)
 	panel:Hide()
 end)
 
---正在聊天/控制台/搜索栏输入时不触发快捷键
+--当前是否不该响应快捷键：聊天/控制台/暂停菜单/模组设置等任何浮层打开时都算。
+--游戏内正常画面下 GetActiveScreen() 返回的就是 ThePlayer.HUD(见 playerhud 的用法)，只有它不是浮层
 local function IsTypingActive()
 	local FE = TheFrontEnd
 	if FE == nil then return false end
+
 	local screen = FE:GetActiveScreen()
-	if screen ~= nil then
-		local name = screen.name or ""
-		if name == "ChatInputScreen" or name == "ConsoleScreen" or name == "DebugMenuScreen" then
-			return true
-		end
-		if screen.edit_text ~= nil then return true end
+	if screen ~= nil and (ThePlayer == nil or screen ~= ThePlayer.HUD) then
+		return true
 	end
 	if FE.forceProcessText == true and FE.textProcessorWidget ~= nil then return true end
 
-	local focus = FE:GetFocusWidget()
-	local function FindEditing(widget, visited)
-		if widget == nil or visited[widget] then return false end
-		visited[widget] = true
-		if widget.editing == true then return true end
-		if FindEditing(widget.parent, visited) then return true end
-		if widget.children then
-			for _, child in ipairs(widget.children) do
-				if FindEditing(child, visited) then return true end
-			end
-		end
-		return false
+	--兜底：焦点控件自己或它的祖先带着 editing 标记(内嵌在 HUD 里的输入框)
+	local w = FE:GetFocusWidget()
+	while w ~= nil do
+		if w.editing == true then return true end
+		w = w.parent
 	end
-	return focus ~= nil and FindEditing(focus, {})
+	return false
 end
 
-GLOBAL.TogglePlantCalcUI = function()
+local function TogglePlantCalcUI()
 	if not (ThePlayer and ThePlayer.HUD) then return end
 	if IsTypingActive() then return end
 	if panel == nil or not panel.inst:IsValid() then return end
@@ -548,8 +598,8 @@ AddClassPostConstruct("cameras/followcamera", function(self)
 end)
 
 --用 KeyUp：长按不会重复触发
-if TUNING.HELPER_PLANT_CALC_KEY ~= nil then
-	TheInput:AddKeyUpHandler(TUNING.HELPER_PLANT_CALC_KEY, function()
-		GLOBAL.TogglePlantCalcUI()
+if HelperConfig.key ~= nil then
+	TheInput:AddKeyUpHandler(HelperConfig.key, function()
+		TogglePlantCalcUI()
 	end)
 end

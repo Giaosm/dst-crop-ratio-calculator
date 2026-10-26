@@ -42,10 +42,33 @@ end
 
 local deltas = {}--plant -> {催长剂, 堆肥, 粪肥}
 
---某作物的净变化，三数之和恒为 0
+--消耗向量是否可用于计算：三个数值分量、且至少消耗一种养分。
+--别的模组可能往 PLANT_DEFS 里加自定义作物，未必写这一项；缺字段的作物直接跳过，不能让整个面板报错
+function Nutrient.IsSupported(plant)
+	local def = PLANT_DEFS[plant]
+	local consume = def ~= nil and def.nutrient_consumption or nil
+	if consume == nil then
+		return false
+	end
+
+	local total = 0
+	for i = 1, 3 do
+		local v = consume[i]
+		if type(v) ~= "number" then
+			return false
+		end
+		total = total + math.abs(v)
+	end
+	return total > 0--全 0(如随机种子)没有净变化可言
+end
+
+--某作物的净变化，三数之和恒为 0；不支持的作物返回 nil
 local function GetDelta(plant)
 	local d = deltas[plant]
 	if d == nil then
+		if not Nutrient.IsSupported(plant) then
+			return nil
+		end
 		local consume = PLANT_DEFS[plant].nutrient_consumption
 
 		local total, back_count = 0, 0
@@ -67,10 +90,10 @@ local function GetDelta(plant)
 	return d
 end
 
---某作物的净养分变化(三数之和恒为 0)，返回副本，避免外部改到内部缓存
+--某作物的净养分变化(三数之和恒为 0)，返回副本，避免外部改到内部缓存；不支持的作物返回 nil
 function Nutrient.GetDelta(plant)
 	local d = GetDelta(plant)
-	return { d[1], d[2], d[3] }
+	return d ~= nil and { d[1], d[2], d[3] } or nil
 end
 
 --一组作物是否存在共同的应季季节(至少一个)。
@@ -132,6 +155,9 @@ local function IsBalanced(crops, counts)
 	local net = { 0, 0, 0 }
 	for i, plant in ipairs(crops) do
 		local d = GetDelta(plant)
+		if d == nil then
+			return false
+		end
 		for k = 1, 3 do
 			net[k] = net[k] + counts[i] * d[k]
 		end
@@ -230,6 +256,9 @@ local function Solve(crops)
 	local vs = {}
 	for i, plant in ipairs(crops) do
 		local d = GetDelta(plant)
+		if d == nil then
+			return nil
+		end
 		vs[i] = { d[1], d[2] }
 	end
 

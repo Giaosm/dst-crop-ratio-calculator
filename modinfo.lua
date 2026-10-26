@@ -2,7 +2,7 @@ name = "简易种植计算器"
 description = [[只支持3种作物的配比计算]]
 author = "哇唧唧哇"
 
-version = "0.0.1.0"--整体.大章节.小章节.优化、修Bug
+version = "0.0.1.1"--整体.大章节.小章节.优化、修Bug
 
 api_version = 10
 
